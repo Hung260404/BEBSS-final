@@ -1,54 +1,45 @@
 const prisma = require("../common/prisma/init.prisma");
 
-// (Logic: Tính toán giờ trống, tạo đơn, đổi trạng thái, phụ thu)
 const bookingService = {
-  // --- API 22: Kiểm tra khung giờ trống (Availability) ---
+  // --- API 22: Kiểm tra khung giờ trống ---
   checkAvailability: async ({ providerId, serviceId, date }) => {
-    // 1. Lấy thông tin Dịch vụ
     const service = await prisma.services.findUnique({
       where: { id: Number(serviceId) },
     });
     if (!service) throw new Error("Dịch vụ không tồn tại");
 
-    const duration = service.duration; // VD: 60 phút
-    const bufferTime = service.buffer_time || 10; // Nghỉ 10 phút
-    const totalSlotTime = duration + bufferTime; // Tổng 1 slot = 70 phút
+    const duration = service.duration;
+    const bufferTime = service.buffer_time || 10;
+    const totalSlotTime = duration + bufferTime;
 
-    // 2. Lấy giờ mở/đóng cửa của Provider
     const provider = await prisma.providers.findUnique({
       where: { user_id: Number(providerId) },
     });
     if (!provider) throw new Error("Provider không tồn tại");
 
-    // Hàm convert giờ "08:00" -> phút
     const timeToMinutes = (timeStr) => {
-      const [hours, minutes] = timeStr.split(":").map(Number);
-      return hours * 60 + minutes;
+      const [h, m] = timeStr.split(":").map(Number);
+      return h * 60 + m;
     };
 
     let startWorkMinutes = timeToMinutes(provider.open_time || "08:00");
     let endWorkMinutes = timeToMinutes(provider.close_time || "22:00");
 
-    // 3. Kiểm tra lịch riêng (Block date / Custom hours)
-    const dayOfWeek = new Date(date).getDay(); // 0: CN, 1: T2...
+    const dayOfWeek = new Date(date).getDay();
     const daySchedule = await prisma.schedules.findFirst({
       where: { provider_id: Number(providerId), day_of_week: dayOfWeek },
     });
 
     if (daySchedule) {
-      if (daySchedule.is_day_off) return []; // Nghỉ cả ngày -> Trả về rỗng
-      // Nếu có giờ riêng thì lấy giờ đó
-      if (daySchedule.start_time) {
-        startWorkMinutes =
-          daySchedule.start_time.getHours() * 60 +
-          daySchedule.start_time.getMinutes();
-        endWorkMinutes =
-          daySchedule.end_time.getHours() * 60 +
-          daySchedule.end_time.getMinutes();
-      }
+      if (daySchedule.is_day_off) return [];
+      startWorkMinutes =
+        daySchedule.start_time.getHours() * 60 +
+        daySchedule.start_time.getMinutes();
+      endWorkMinutes =
+        daySchedule.end_time.getHours() * 60 +
+        daySchedule.end_time.getMinutes();
     }
 
-    // 4. Lấy các đơn ĐÃ ĐẶT trong ngày (để loại trừ)
     const searchDate = new Date(date);
     const nextDate = new Date(date);
     nextDate.setDate(searchDate.getDate() + 1);
@@ -56,53 +47,41 @@ const bookingService = {
     const existBookings = await prisma.bookings.findMany({
       where: {
         provider_id: Number(providerId),
-        status: { notIn: ["CANCELLED", "REJECTED"] }, // Lấy đơn Confirmed hoặc Pending
-        booking_date: {
-          gte: searchDate,
-          lt: nextDate,
-        },
+        status: { notIn: ["CANCELLED", "REJECTED"] },
+        booking_date: { gte: searchDate, lt: nextDate },
       },
       select: { start_time: true, end_time: true },
     });
 
-    // Chuyển đơn đã đặt sang phút [start, end]
     const bookedSlots = existBookings.map((b) => ({
       start: b.start_time.getHours() * 60 + b.start_time.getMinutes(),
       end: b.end_time.getHours() * 60 + b.end_time.getMinutes(),
     }));
 
-    // 5. Thuật toán tìm slot trống
-    let availableSlots = [];
+    const availableSlots = [];
     let currentSlotStart = startWorkMinutes;
 
     while (currentSlotStart + duration <= endWorkMinutes) {
       const currentSlotEnd = currentSlotStart + duration;
-
-      // Check trùng
-      const isConflict = bookedSlots.some((booking) => {
-        return currentSlotStart < booking.end && currentSlotEnd > booking.start;
-      });
+      const isConflict = bookedSlots.some(
+        (b) => currentSlotStart < b.end && currentSlotEnd > b.start
+      );
 
       if (!isConflict) {
-        // Đổi phút ra giờ:phút "08:30"
-        const toTimeStr = (totalMins) => {
-          const h = Math.floor(totalMins / 60)
-            .toString()
-            .padStart(2, "0");
-          const m = (totalMins % 60).toString().padStart(2, "0");
-          return `${h}:${m}`;
-        };
-        availableSlots.push(toTimeStr(currentSlotStart));
+        const h = Math.floor(currentSlotStart / 60)
+          .toString()
+          .padStart(2, "0");
+        const m = (currentSlotStart % 60).toString().padStart(2, "0");
+        availableSlots.push(`${h}:${m}`);
       }
 
-      // Cộng thêm thời gian làm + nghỉ để nhảy slot tiếp theo
       currentSlotStart += totalSlotTime;
     }
 
     return availableSlots;
   },
 
-  // --- API 23 & 24: Tạo Booking mới ---
+  // --- API 23: Tạo booking ---
   createBooking: async ({
     userId,
     providerId,
@@ -111,200 +90,141 @@ const bookingService = {
     startTime,
     paymentMethod,
   }) => {
-    // Lấy service
-    const service = await prisma.services.findUnique({
-      where: { id: Number(serviceId) },
-    });
-    if (!service) throw new Error("Dịch vụ không tồn tại");
+    return await prisma.$transaction(async (tx) => {
+      const service = await tx.services.findUnique({
+        where: { id: Number(serviceId) },
+      });
+      if (!service) throw new Error("Dịch vụ không tồn tại");
 
-    // Tính giờ kết thúc
-    const startDateTime = new Date(`${date}T${startTime}`);
-    const endDateTime = new Date(
-      startDateTime.getTime() + service.duration * 60000
-    );
+      const startDateTime = new Date(`${date}T${startTime}`);
+      const endDateTime = new Date(
+        startDateTime.getTime() + service.duration * 60000
+      );
 
-    // Check trùng lần cuối
-    const conflict = await prisma.bookings.findFirst({
-      where: {
-        provider_id: Number(providerId),
-        status: { notIn: ["CANCELLED", "REJECTED"] },
-        booking_date: new Date(date),
-        OR: [
-          {
-            start_time: { lte: startDateTime },
-            end_time: { gt: startDateTime },
-          },
-          { start_time: { lt: endDateTime }, end_time: { gte: endDateTime } },
-        ],
-      },
-    });
-
-    if (conflict)
-      throw new Error("Rất tiếc! Slot này vừa có người đặt mất rồi.");
-
-    // Tạo Booking
-    const newBooking = await prisma.bookings.create({
-      data: {
-        customer_id: userId,
-        provider_id: Number(providerId),
-        service_id: Number(serviceId),
-        booking_date: new Date(date),
-        start_time: startDateTime,
-        end_time: endDateTime,
-        total_amount: service.price,
-        status: "PENDING_PAYMENT",
-      },
-    });
-
-    // Tạo Payment Record (Chờ thanh toán)
-    await prisma.payments.create({
-      data: {
-        booking_id: newBooking.id,
-        amount: service.price,
-        method: paymentMethod || "CASH",
-        status: "PENDING",
-      },
-    });
-
-    return newBooking;
-  },
-
-  // --- API 25: Lịch sử Booking ---
-  getHistory: async (userId, role) => {
-    const whereCondition =
-      role === "PROVIDER" ? { provider_id: userId } : { customer_id: userId };
-
-    return await prisma.bookings.findMany({
-      where: whereCondition,
-      include: {
-        services: { select: { name: true } },
-        users: {
-          select: { full_name: true, phone: true }, // Lấy thông tin khách
-        },
-        providers: {
-          select: {
-            business_name: true,
-            address: true,
-            // Quan trọng: Lấy phone của Provider qua bảng users
-            users: {
-              select: { phone: true, avatar_url: true },
+      // 🔒 CHECK TRÙNG SLOT TRONG TRANSACTION
+      const conflict = await tx.bookings.findFirst({
+        where: {
+          provider_id: Number(providerId),
+          booking_date: new Date(date),
+          status: { notIn: ["CANCELLED", "REJECTED"] },
+          OR: [
+            {
+              start_time: { lte: startDateTime },
+              end_time: { gt: startDateTime },
             },
-          },
+            {
+              start_time: { lt: endDateTime },
+              end_time: { gte: endDateTime },
+            },
+          ],
         },
-      },
-      orderBy: { created_at: "desc" },
+      });
+
+      if (conflict) {
+        throw new Error("Slot này vừa được người khác đặt trước");
+      }
+
+      // ✅ CREATE BOOKING
+      const booking = await tx.bookings.create({
+        data: {
+          customer_id: userId,
+          provider_id: Number(providerId),
+          service_id: Number(serviceId),
+          booking_date: new Date(date),
+          start_time: startDateTime,
+          end_time: endDateTime,
+          total_amount: service.price,
+          status: "PENDING_PAYMENT",
+        },
+      });
+
+      // CREATE PAYMENT
+      await tx.payments.create({
+        data: {
+          booking_id: booking.id,
+          amount: service.price,
+          method: paymentMethod || "CASH",
+          status: "PENDING",
+        },
+      });
+
+      return booking;
     });
   },
 
-  // --- API 26: Chi tiết Booking ---
-  getDetail: async (userId, bookingId) => {
+  // --- API: Khách thanh toán ---
+  customerPay: async ({ userId, bookingId, method, transactionCode }) => {
     const booking = await prisma.bookings.findUnique({
       where: { id: Number(bookingId) },
-      include: {
-        services: true,
-        payments: true,
-        sub_orders: true,
-
-        // 1. Lấy thông tin khách hàng (Người đặt)
-        users: {
-          select: {
-            full_name: true,
-            phone: true,
-            avatar_url: true,
-            email: true,
-          },
-        },
-
-        // 2. Lấy thông tin Chủ Shop (Provider)
-        providers: {
-          select: {
-            business_name: true,
-            address: true,
-            trust_score: true,
-            // SỬA LỖI: Lấy sđt và avatar từ bảng users (Nested Relation)
-            users: {
-              select: {
-                phone: true,
-                avatar_url: true,
-                email: true,
-              },
-            },
-          },
-        },
-      },
+      include: { payments: true },
     });
 
-    if (!booking) throw new Error("Đơn đặt lịch không tồn tại");
+    if (!booking) throw new Error("Không tìm thấy booking");
+    if (booking.customer_id !== userId)
+      throw new Error("Bạn không có quyền thanh toán");
 
-    // Bảo mật: Chỉ chủ đơn hoặc chủ shop mới được xem
-    if (booking.customer_id !== userId && booking.provider_id !== userId) {
-      // throw new Error("Bạn không có quyền xem đơn này");
-    }
+    if (booking.status !== "PENDING_PAYMENT")
+      throw new Error("Booking không ở trạng thái chờ thanh toán");
 
-    // Flatten data cho dễ dùng (Tùy chọn)
-    const responseData = {
-      ...booking,
-      provider_info: {
-        business_name: booking.providers.business_name,
-        address: booking.providers.address,
-        phone: booking.providers.users.phone, // Đã lấy được sđt
-        avatar: booking.providers.users.avatar_url, // Đã lấy được avatar
-      },
-      customer_info: booking.users,
-    };
+    // 🔒 Chặn thanh toán trùng
+    const existingPayment = booking.payments.find(
+      (p) => p.status === "PENDING" || p.status === "PROCESSING"
+    );
+    if (existingPayment) throw new Error("Đơn này đã có yêu cầu thanh toán");
 
-    // Xóa key thừa cho gọn
-    delete responseData.providers;
-    delete responseData.users;
-
-    return responseData;
-  },
-
-  // --- API 27: Khách hủy đơn ---
-  cancelBooking: async (userId, bookingId, reason) => {
-    const booking = await prisma.bookings.findFirst({
-      where: { id: Number(bookingId), customer_id: userId },
-    });
-    if (!booking) throw new Error("Đơn không tồn tại");
-    if (["COMPLETED", "CANCELLED", "REJECTED"].includes(booking.status)) {
-      throw new Error("Không thể hủy đơn ở trạng thái này");
-    }
-
-    return await prisma.bookings.update({
-      where: { id: Number(bookingId) },
-      data: { status: "CANCELLED", cancellation_reason: reason },
-    });
-  },
-
-  // --- API 28, 29, 30: Provider xử lý đơn ---
-  updateStatus: async (providerId, bookingId, status) => {
-    const booking = await prisma.bookings.findFirst({
-      where: { id: Number(bookingId), provider_id: providerId },
-    });
-    if (!booking) throw new Error("Đơn không tồn tại hoặc không phải của bạn");
-
-    return await prisma.bookings.update({
-      where: { id: Number(bookingId) },
-      data: { status: status },
-    });
-  },
-
-  // --- API 31: Tạo đơn phụ thu (Sub-order) ---
-  createSubOrder: async (providerId, bookingId, amount, note) => {
-    const booking = await prisma.bookings.findFirst({
-      where: { id: Number(bookingId), provider_id: providerId },
-    });
-    if (!booking) throw new Error("Đơn không hợp lệ");
-
-    return await prisma.sub_orders.create({
-      data: {
-        booking_id: Number(bookingId),
-        amount: parseFloat(amount),
-        note: note,
+    // 👉 PHẦN BẠN HỎI: LẤY PHỤ THU
+    const subOrders = await prisma.sub_orders.findMany({
+      where: {
+        booking_id: booking.id,
         status: "UNPAID",
       },
     });
+
+    const subTotal = subOrders.reduce((sum, o) => sum + o.amount, 0);
+    const totalAmount = booking.total_amount + subTotal;
+
+    // CASH thì chờ provider xác nhận, ONLINE thì chờ webhook
+    const paymentStatus = method === "CASH" ? "PENDING" : "PROCESSING";
+
+    return await prisma.payments.create({
+      data: {
+        booking_id: booking.id,
+        transaction_code: transactionCode || null,
+        amount: totalAmount, // ✅ DÙNG totalAmount
+        method,
+        status: paymentStatus,
+      },
+    });
+  },
+
+  // --- API: Provider xác nhận đã nhận tiền ---
+  providerConfirmPayment: async (providerId, bookingId) => {
+    const booking = await prisma.bookings.findUnique({
+      where: { id: Number(bookingId) },
+      include: { payments: true },
+    });
+
+    if (!booking) throw new Error("Không tìm thấy booking");
+    if (booking.provider_id !== providerId) throw new Error("Không có quyền");
+
+    const payment = booking.payments[0];
+    if (!payment) throw new Error("Chưa có thanh toán");
+
+    if (payment.method !== "CASH")
+      throw new Error("Thanh toán online không xác nhận thủ công");
+
+    await prisma.payments.update({
+      where: { id: payment.id },
+      data: {
+        status: "SUCCESS",
+        payment_time: new Date(),
+      },
+    });
+
+    return await prisma.bookings.update({
+      where: { id: booking.id },
+      data: { status: "PAID" },
+    });
   },
 };
-
 module.exports = bookingService;
